@@ -1,0 +1,149 @@
+import telebot
+import yt_dlp
+import os
+import re
+import time
+import logging
+import threading
+from queue import Queue
+
+# ==================== SOZLAMALAR ====================
+BOT_TOKEN = "8715441646:AAGaPRcT9tG3T7G1kDjyu6KHV1ZxUTy4WpE"
+DOWNLOAD_DIR = "downloads"
+COOKIES_FILE = "cookies.txt"   # ixtiyoriy — private akkaunt uchun (pastda tushuntirilgan)
+MAX_FILE_SIZE_MB = 1000           # Telegram bot API cheklovi
+
+os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+
+# ==================== LOGGING ====================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler("bot.log", encoding="utf-8"),
+        logging.StreamHandler()
+    ]
+)
+log = logging.getLogger(__name__)
+
+bot = telebot.TeleBot(BOT_TOKEN)
+task_queue = Queue()
+
+# ==================== YORDAMCHI FUNKSIYALAR ====================
+def is_instagram_link(text: str) -> bool:
+    return bool(re.match(r"^https?://(www\.)?instagram\.com/", text.strip()))
+
+def get_ydl_opts(unique_id: str) -> dict:
+    opts = {
+        "outtmpl": f"{DOWNLOAD_DIR}/{unique_id}.%(ext)s",
+        "format": "best[ext=mp4]/best",
+        "quiet": True,
+        "no_warnings": True,
+        "socket_timeout": 30,
+        "retries": 5,
+        "fragment_retries": 5,
+        "concurrent_fragment_downloads": 4,
+        "http_headers": {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        },
+    }
+    # Agar cookies.txt fayli mavjud bo'lsa — private/login talab qiladigan
+    # kontent uchun ishlatiladi (faqat o'zingiz kira oladigan akkauntlar uchun)
+    if os.path.exists(COOKIES_FILE):
+        opts["cookiefile"] = COOKIES_FILE
+    return opts
+
+def download_video(url: str, unique_id: str) -> str:
+    ydl_opts = get_ydl_opts(unique_id)
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        filename = ydl.prepare_filename(info)
+    return filename
+
+def download_with_retry(url: str, unique_id: str, max_attempts: int = 3) -> str:
+    last_error = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            log.info(f"Urinish {attempt}/{max_attempts}: {url}")
+            return download_video(url, unique_id)
+        except Exception as e:
+            last_error = e
+            log.warning(f"Urinish {attempt} muvaffaqiyatsiz: {e}")
+            time.sleep(2 * attempt)  # har urinishda kutish vaqti oshadi
+    raise last_error
+
+def format_error(e: Exception) -> str:
+    text = str(e)
+    if "Private" in text or "login" in text.lower():
+        return "🔒 Bu akkaunt yopiq (private). Faqat o'zingiz kira oladigan akkauntlarni yuklab olishingiz mumkin."
+    if "does not exist" in text or "404" in text:
+        return "❌ Havola noto'g'ri yoki post o'chirilgan."
+    if "timed out" in text.lower() or "timeout" in text.lower():
+        return "⏱ Internet aloqasi vaqtinchalik uzildi. Qayta urinib ko'ring."
+    return f"❌ Xatolik yuz berdi: {text[:200]}"
+
+# ==================== ISHLOV BERISH (QUEUE) ====================
+def worker():
+    while True:
+        message, url = task_queue.get()
+        process_download(message, url)
+        task_queue.task_done()
+
+def process_download(message, url):
+    chat_id = message.chat.id
+    unique_id = f"{chat_id}_{int(time.time())}"
+    status_msg = bot.reply_to(message, "⏳ Video aniqlanmoqda...")
+
+    filepath = None
+    try:
+        filepath = download_with_retry(url, unique_id)
+
+        size_mb = os.path.getsize(filepath) / (1024 * 1024)
+        log.info(f"Yuklandi: {filepath} ({size_mb:.2f} MB)")
+
+        if size_mb > MAX_FILE_SIZE_MB:
+            bot.edit_message_text(
+                f"⚠️ Video juda katta ({size_mb:.1f} MB). Telegram bot {MAX_FILE_SIZE_MB} MB dan katta faylni yubora olmaydi.",
+                chat_id, status_msg.message_id
+            )
+            return
+
+        bot.edit_message_text("📤 Yuborilmoqda...", chat_id, status_msg.message_id)
+        with open(filepath, "rb") as video:
+            bot.send_video(chat_id, video, timeout=120, supports_streaming=True)
+
+        bot.delete_message(chat_id, status_msg.message_id)
+        log.info(f"Muvaffaqiyatli yuborildi: chat_id={chat_id}")
+
+    except Exception as e:
+        log.error(f"Xatolik: {e}")
+        bot.edit_message_text(format_error(e), chat_id, status_msg.message_id)
+
+    finally:
+        if filepath and os.path.exists(filepath):
+            os.remove(filepath)
+
+# ==================== BOT HANDLERLARI ====================
+@bot.message_handler(commands=["start"])
+def start_handler(message):
+    bot.reply_to(
+        message,
+        "👋 Salom! Menga Instagram post yoki reel havolasini yuboring — men uni video sifatida yuklab beraman."
+    )
+
+@bot.message_handler(func=lambda m: True)
+def handle_message(message):
+    text = message.text.strip() if message.text else ""
+
+    if not is_instagram_link(text):
+        bot.reply_to(message, "Iltimos, to'g'ri Instagram havolasini yuboring.\nMisol: https://www.instagram.com/reel/...")
+        return
+
+    log.info(f"Yangi so'rov: chat_id={message.chat.id}, url={text}")
+    task_queue.put((message, text))
+
+# ==================== ISHGA TUSHIRISH ====================
+if __name__ == "__main__":
+    threading.Thread(target=worker, daemon=True).start()
+    log.info("Bot ishga tushdi...")
+    bot.infinity_polling(timeout=60, long_polling_timeout=60)
